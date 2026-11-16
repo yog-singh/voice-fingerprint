@@ -132,16 +132,30 @@ def get_vad(backend: str, sample_rate: int = 16000) -> Optional[VAD]:
     raise ValueError(f"unknown VAD backend {backend!r}; expected 'energy', 'silero' or 'none'")
 
 
+def robust_speech_mask(
+    wav: np.ndarray, vad: Optional[VAD], sample_rate: int, min_keep_ratio: float = 0.1
+) -> np.ndarray:
+    """Per-sample speech mask, or all True when there is no VAD or it rejected almost everything."""
+    if vad is None:
+        return np.ones(len(wav), dtype=bool)
+    mask = np.asarray(vad.speech_mask(wav, sample_rate), dtype=bool)
+    if mask.sum() < min_keep_ratio * len(wav):
+        log.warning(
+            "VAD kept only %.1f%% of the audio; treating the whole waveform as speech",
+            100 * mask.sum() / max(len(wav), 1),
+        )
+        return np.ones(len(wav), dtype=bool)
+    return mask
+
+
 def apply_vad(wav: np.ndarray, vad: Optional[VAD], sample_rate: int, min_keep_ratio: float = 0.1) -> np.ndarray:
     """Drop non-speech samples, but keep the original if the VAD removed almost everything."""
     if vad is None:
         return wav
-    mask = vad.speech_mask(wav, sample_rate)
-    kept = wav[mask]
-    if len(kept) < min_keep_ratio * len(wav):
-        log.warning("VAD kept only %.1f%% of the audio; falling back to the untrimmed waveform", 100 * len(kept) / max(len(wav), 1))
+    mask = robust_speech_mask(wav, vad, sample_rate, min_keep_ratio)
+    if mask.all():
         return wav
-    return np.ascontiguousarray(kept)
+    return np.ascontiguousarray(wav[mask])
 
 
 def mask_to_segments(mask: np.ndarray) -> List[Segment]:
