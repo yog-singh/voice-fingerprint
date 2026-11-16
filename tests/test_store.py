@@ -72,3 +72,55 @@ def test_empty_book_shapes():
     assert names == [] and centroids.shape == (0, DIM)
     embeddings, labels = book.all_embeddings()
     assert embeddings.shape == (0, DIM) and labels == []
+
+
+def test_thresholds_and_cohort_roundtrip(tmp_path):
+    book = _book()
+    book.set_cohort(np.random.default_rng(1).standard_normal((7, DIM)), top_k=5)
+    book.set_threshold("cosine", 0.31)
+    book.set_threshold("asnorm", 2.5)
+    loaded = SpeakerBook.load(book.save(tmp_path / "speakers"))
+
+    assert loaded.thresholds == {"cosine": 0.31, "asnorm": 2.5}
+    assert loaded.cohort.shape == (7, DIM) and loaded.cohort_top_k == 5
+    np.testing.assert_allclose(loaded.cohort, book.cohort, atol=1e-6)
+
+
+def test_book_without_cohort_roundtrips_as_none(tmp_path):
+    loaded = SpeakerBook.load(_book().save(tmp_path / "speakers"))
+    assert loaded.cohort is None and loaded.thresholds == {}
+
+
+def test_version_1_books_still_load(tmp_path):
+    import json
+
+    path = tmp_path / "old.npz"
+    header = {"version": 1, "model": "test_model", "embedding_dim": DIM,
+              "speakers": [{"name": "alice", "key": "emb_0", "metadata": {}}]}
+    np.savez_compressed(path, header=np.array(json.dumps(header)), emb_0=np.ones((2, DIM), dtype=np.float32))
+    loaded = SpeakerBook.load(path, expect_model="test_model")
+    assert loaded.names == ["alice"] and loaded.thresholds == {} and loaded.cohort is None
+
+
+def test_changing_the_cohort_drops_the_asnorm_threshold_only():
+    rng = np.random.default_rng(2)
+    book = _book()
+    cohort = rng.standard_normal((5, DIM))
+    book.set_cohort(cohort)
+    book.set_threshold("cosine", 0.3)
+    book.set_threshold("asnorm", 2.0)
+
+    book.set_cohort(cohort.copy())  # same cohort: threshold still valid
+    assert book.thresholds == {"cosine": 0.3, "asnorm": 2.0}
+
+    book.set_cohort(rng.standard_normal((5, DIM)))
+    assert book.thresholds == {"cosine": 0.3}
+
+    book.set_threshold("asnorm", 2.0)
+    book.set_cohort(None)
+    assert book.thresholds == {"cosine": 0.3} and book.cohort is None
+
+
+def test_unknown_score_type_is_rejected():
+    with pytest.raises(ValueError, match="unknown score type"):
+        _book().set_threshold("plda", 1.0)

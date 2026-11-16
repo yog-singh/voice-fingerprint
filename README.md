@@ -78,6 +78,7 @@ rejects. Derive it from your own data.
 ```python
 report = vp.calibrate()   # needs >= 2 enrolled speakers with several clips each
 print(report["threshold"], report["eer"])
+vp.save("speakers")       # the calibrated threshold is saved with the book
 ```
 
 For deployments spanning several recording conditions, enable AS-norm. It rescales each
@@ -86,6 +87,23 @@ makes one threshold transfer across devices far better than raw cosine does.
 
 ```python
 vp.set_cohort(list(Path("background_speakers").glob("*.wav")))
+vp.calibrate()            # AS-norm scores need their own threshold
+vp.save("speakers")       # stores the cohort too
+```
+
+AS-norm scores are on a different scale from cosine scores (roughly z-scores, not
+`[-1, 1]`), so each threshold belongs to one score type. The speaker book keeps one per
+type, and the active one follows whether a cohort is set. With a cohort but no AS-norm
+threshold, `verify()` and `identify()` raise `CalibrationError` rather than compare
+against the cosine default. Changing the cohort discards the old AS-norm threshold.
+A `threshold=` argument (CLI: `--threshold`) overrides for that call or instance and is
+never saved.
+
+```bash
+voicefingerprint calibrate --book speakers                  # fits and saves the threshold
+voicefingerprint cohort --book speakers background/*.wav    # enable AS-norm
+voicefingerprint calibrate --book speakers                  # fit the AS-norm threshold
+voicefingerprint cohort --book speakers --clear             # back to raw cosine
 ```
 
 ## Measured behaviour

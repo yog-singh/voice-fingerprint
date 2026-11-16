@@ -74,7 +74,7 @@ from types import SimpleNamespace
 from voicefingerprint.chunking import compute_chunks
 from voicefingerprint.config import ChunkConfig, Config, PreprocessConfig
 from voicefingerprint.diarize import _to_source_time, assign_to_enrolled, diarize
-from voicefingerprint.scoring import l2_normalize
+from voicefingerprint.scoring import cosine_matrix, l2_normalize
 
 SR = 16000
 
@@ -115,6 +115,7 @@ def _fake_recognizer(vad="energy", book=None, threshold=0.4):
         encoder=_FakeEncoder(),
         book=book,
         threshold=threshold,
+        score_matrix=cosine_matrix,
     )
 
 

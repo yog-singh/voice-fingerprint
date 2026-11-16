@@ -5,6 +5,7 @@ from .diarize import Turn, assign_to_enrolled, diarize
 from .encoder import SpeakerEncoder
 from .exceptions import (
     AudioError,
+    CalibrationError,
     EnrollmentError,
     FeatureError,
     ModelError,
@@ -22,6 +23,7 @@ __version__ = "0.1.0"
 __all__ = [
     "ASNorm",
     "AudioError",
+    "CalibrationError",
     "ChunkConfig",
     "Config",
     "EncoderConfig",

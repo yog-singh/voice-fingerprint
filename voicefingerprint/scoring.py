@@ -38,16 +38,22 @@ class ASNorm:
         self.cohort = l2_normalize(np.atleast_2d(np.asarray(self.cohort, dtype=np.float32)))
         self.top_k = min(self.top_k, len(self.cohort))
 
-    def _stats(self, embedding: np.ndarray) -> Tuple[float, float]:
-        scores = matmul(self.cohort, l2_normalize(embedding.ravel()))
-        top = np.sort(scores)[-self.top_k :]
-        return float(top.mean()), float(top.std() + 1e-9)
+    def stats(self, embeddings: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Mean and std of each row's top-k cohort scores, shape (n,) each."""
+        scores = matmul(l2_normalize(np.atleast_2d(embeddings)), self.cohort.T)
+        top = np.sort(scores, axis=1)[:, -self.top_k :]
+        return top.mean(axis=1), top.std(axis=1) + 1e-9
+
+    def matrix(self, a: np.ndarray, b: np.ndarray, raw: Optional[np.ndarray] = None) -> np.ndarray:
+        """AS-normalized scores between rows of a (n, d) and b (m, d), shape (n, m)."""
+        raw = cosine_matrix(a, b) if raw is None else raw
+        mu_a, sd_a = self.stats(a)
+        mu_b, sd_b = self.stats(b)
+        return 0.5 * ((raw - mu_a[:, None]) / sd_a[:, None] + (raw - mu_b[None, :]) / sd_b[None, :])
 
     def __call__(self, enroll: np.ndarray, test: np.ndarray, raw: Optional[float] = None) -> float:
-        raw = cosine(enroll, test) if raw is None else raw
-        mu_e, sd_e = self._stats(enroll)
-        mu_t, sd_t = self._stats(test)
-        return 0.5 * ((raw - mu_e) / sd_e + (raw - mu_t) / sd_t)
+        raw_matrix = None if raw is None else np.array([[raw]])
+        return float(self.matrix(enroll.ravel(), test.ravel(), raw_matrix)[0, 0])
 
 
 def equal_error_rate(scores: Sequence[float], labels: Sequence[int]) -> Tuple[float, float]:
@@ -73,18 +79,31 @@ def equal_error_rate(scores: Sequence[float], labels: Sequence[int]) -> Tuple[fl
     return float((far[idx] + frr[idx]) / 2), threshold
 
 
-def calibrate_threshold(embeddings: np.ndarray, speaker_ids: Sequence[str]) -> dict:
+SCORE_COSINE = "cosine"
+SCORE_ASNORM = "asnorm"
+
+
+def score_type(asnorm: Optional[ASNorm]) -> str:
+    """Name of the units scores are in. A threshold is only valid for scores of its type."""
+    return SCORE_ASNORM if asnorm is not None else SCORE_COSINE
+
+
+def calibrate_threshold(
+    embeddings: np.ndarray, speaker_ids: Sequence[str], asnorm: Optional[ASNorm] = None
+) -> dict:
     """Derive an operating threshold from labelled embeddings.
 
     Pass several utterances per speaker for at least a handful of speakers. A hardcoded
     threshold is meaningless across microphones and languages; this is the honest way.
+    With asnorm, trials are scored the same way verification will score them, so the
+    threshold comes out in AS-norm units; the report's "score_type" says which.
     """
     embeddings = l2_normalize(np.asarray(embeddings, dtype=np.float32))
     ids = np.asarray(speaker_ids)
     if len(embeddings) != len(ids):
         raise ValueError("embeddings and speaker_ids must have the same length")
 
-    sim = matmul(embeddings, embeddings.T)
+    sim = asnorm.matrix(embeddings, embeddings) if asnorm is not None else matmul(embeddings, embeddings.T)
     iu = np.triu_indices(len(ids), k=1)
     scores = sim[iu]
     labels = (ids[iu[0]] == ids[iu[1]]).astype(np.int8)
@@ -92,6 +111,7 @@ def calibrate_threshold(embeddings: np.ndarray, speaker_ids: Sequence[str]) -> d
     eer, threshold = equal_error_rate(scores, labels)
     return {
         "threshold": threshold,
+        "score_type": score_type(asnorm),
         "eer": eer,
         "n_trials": int(len(scores)),
         "n_target": int(labels.sum()),

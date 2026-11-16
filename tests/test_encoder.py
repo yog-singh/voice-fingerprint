@@ -5,6 +5,7 @@ import pytest
 
 from voicefingerprint import Config, VoiceRecognizer
 from voicefingerprint.exceptions import EnrollmentError, ModelError
+from voicefingerprint.store import SpeakerBook
 
 SR = 16000
 
@@ -78,3 +79,81 @@ def test_diarize_timestamps_survive_a_silent_gap(encoder, wav_a, wav_b):
     assert turns[-1].end == pytest.approx(14.0, abs=0.05)
     assert turns[-1].start == pytest.approx(10.0, abs=0.5)
     assert not any(t.start < 9.0 and t.end > 5.0 for t in turns), "no turn should cover the silent gap"
+
+
+def _two_speaker_recognizer(wav_a, wav_b, **kwargs):
+    recognizer = VoiceRecognizer(Config(), **kwargs)
+    recognizer.enroll("a", [wav_a[: 2 * SR], wav_a[2 * SR :]], source_sr=SR)
+    recognizer.enroll("b", [wav_b[: 2 * SR], wav_b[2 * SR :]], source_sr=SR)
+    return recognizer
+
+
+def _cohort_embeddings(encoder, n=6):
+    from conftest import _voice_like
+
+    return np.stack([encoder.embed_utterance(_voice_like(3.0, 90.0 + 25 * i, seed=100 + i)) for i in range(n)])
+
+
+def test_calibrated_threshold_is_saved_and_restored(encoder, tmp_path, wav_a, wav_b):
+    recognizer = _two_speaker_recognizer(wav_a, wav_b)
+    report = recognizer.calibrate()
+    assert report["score_type"] == "cosine"
+    path = recognizer.save(tmp_path / "book")
+
+    fresh = VoiceRecognizer(Config())
+    assert fresh.threshold == encoder.spec.default_threshold
+    fresh.load(path)
+    assert fresh.threshold == pytest.approx(report["threshold"])
+
+
+def test_explicit_threshold_overrides_but_is_not_saved(encoder, tmp_path, wav_a, wav_b):
+    recognizer = _two_speaker_recognizer(wav_a, wav_b, threshold=0.123)
+    assert recognizer.threshold == 0.123
+    path = recognizer.save(tmp_path / "book")
+    assert VoiceRecognizer(Config(), book=SpeakerBook.load(path)).threshold == encoder.spec.default_threshold
+
+
+def test_asnorm_needs_its_own_threshold(encoder, wav_a, wav_b):
+    from voicefingerprint.exceptions import CalibrationError
+
+    recognizer = _two_speaker_recognizer(wav_a, wav_b)
+    recognizer.calibrate()
+    cosine_threshold = recognizer.threshold
+
+    recognizer.book.set_cohort(_cohort_embeddings(encoder))
+    assert recognizer.score_type == "asnorm"
+    with pytest.raises(CalibrationError, match="no AS-norm threshold"):
+        recognizer.identify(wav_a[: 3 * SR], source_sr=SR)
+
+    report = recognizer.calibrate()
+    assert report["score_type"] == "asnorm"
+    assert recognizer.book.thresholds["cosine"] == cosine_threshold  # untouched
+    assert recognizer.threshold == report["threshold"]
+
+    matches = recognizer.identify(wav_a[: 3 * SR], source_sr=SR)
+    assert matches[0].name == "a"
+    assert recognizer.verify(wav_a[: 2 * SR], wav_a[2 * SR :], source_sr=SR).normalized
+
+    recognizer.clear_cohort()
+    assert recognizer.score_type == "cosine" and recognizer.threshold == cosine_threshold
+
+
+def test_identify_with_asnorm_matches_pairwise_scoring(encoder, wav_a, wav_b):
+    recognizer = _two_speaker_recognizer(wav_a, wav_b, threshold=0.0)
+    recognizer.book.set_cohort(_cohort_embeddings(encoder))
+    probe = wav_a[: 3 * SR]
+    matches = {m.name: m.score for m in recognizer.identify(probe, source_sr=SR)}
+    embedding = recognizer.embed(probe, source_sr=SR)
+    for name in ("a", "b"):
+        expected = recognizer.asnorm(recognizer.book[name].centroid, embedding)
+        assert matches[name] == pytest.approx(expected, rel=1e-5, abs=1e-5)
+
+
+def test_calibrate_needs_repeat_clips(encoder, wav_a, wav_b):
+    from voicefingerprint.exceptions import CalibrationError
+
+    recognizer = VoiceRecognizer(Config())
+    recognizer.enroll("a", [wav_a], source_sr=SR)
+    recognizer.enroll("b", [wav_b], source_sr=SR)
+    with pytest.raises(CalibrationError, match="two or more clips"):
+        recognizer.calibrate()
