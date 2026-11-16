@@ -70,3 +70,26 @@ def test_asnorm_preserves_ranking_but_rescales():
     norm = ASNorm(cohort, top_k=20)
     assert norm(a, close) > norm(a, far)
     assert norm(a, close) != pytest.approx(cosine(a, close))
+
+
+def test_asnorm_matrix_matches_pairwise_calls():
+    rng = np.random.default_rng(3)
+    norm = ASNorm(rng.standard_normal((40, 16)), top_k=10)
+    a, b = rng.standard_normal((3, 16)), rng.standard_normal((4, 16))
+    expected = np.array([[norm(x, y) for y in b] for x in a])
+    np.testing.assert_allclose(norm.matrix(a, b), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_calibrate_with_asnorm_reports_normalized_units():
+    rng = np.random.default_rng(4)
+    centers = rng.standard_normal((4, 32))
+    embeddings = np.array([c + 0.3 * rng.standard_normal(32) for c in centers for _ in range(5)])
+    ids = [f"spk{i}" for i in range(4) for _ in range(5)]
+    norm = ASNorm(rng.standard_normal((60, 32)), top_k=20)
+
+    raw = calibrate_threshold(embeddings, ids)
+    normalized = calibrate_threshold(embeddings, ids, asnorm=norm)
+    assert raw["score_type"] == "cosine" and normalized["score_type"] == "asnorm"
+    assert -1 <= raw["threshold"] <= 1
+    assert normalized["threshold"] > 1  # z-score-like: far outside the cosine range
+    assert normalized["eer"] < 0.05

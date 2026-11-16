@@ -62,27 +62,56 @@ def cmd_enroll(args):
 
 def cmd_list(args):
     book = SpeakerBook.load(args.book)
-    _emit({"model": book.model, "speakers": book.summary()})
+    _emit({
+        "model": book.model,
+        "thresholds": book.thresholds,
+        "cohort": None if book.cohort is None else {"size": len(book.cohort), "top_k": book.cohort_top_k},
+        "speakers": book.summary(),
+    })
 
 
 def cmd_verify(args):
     recognizer = _build(args)
     result = recognizer.verify(args.a, args.b)
-    _emit({"score": result.score, "threshold": result.threshold,
-           "accepted": result.accepted, "score_normalized": result.normalized})
+    _emit({"score": result.score, "threshold": result.threshold, "accepted": result.accepted,
+           "score_type": recognizer.score_type, "score_normalized": result.normalized})
     return 0 if result.accepted else 1
 
 
 def cmd_identify(args):
     recognizer = _build(args)
     matches = recognizer.identify(args.audio, top_k=args.top_k)
-    _emit({"threshold": recognizer.threshold,
+    _emit({"threshold": recognizer.threshold, "score_type": recognizer.score_type,
            "matches": [{"name": m.name, "score": m.score, "accepted": m.accepted} for m in matches]})
 
 
 def cmd_calibrate(args):
     recognizer = _build(args)
-    _emit(recognizer.calibrate())
+    report = recognizer.calibrate()
+    report["book"] = str(recognizer.save(args.book))
+    _emit(report)
+
+
+def cmd_cohort(args):
+    recognizer = _build(args)
+    if args.clear:
+        if args.audio:
+            raise VoicefingerprintError("pass either --clear or audio files, not both")
+        recognizer.clear_cohort()
+    elif args.audio:
+        recognizer.set_cohort(args.audio, top_k=args.top_k)
+    else:
+        raise VoicefingerprintError("pass background audio files, or --clear")
+    path = recognizer.save(args.book)
+    book = recognizer.book
+    _emit({
+        "book": str(path),
+        "score_type": recognizer.score_type,
+        "cohort_size": 0 if book.cohort is None else len(book.cohort),
+        "thresholds": book.thresholds,
+        "next": "run 'voicefingerprint calibrate' to fit an AS-norm threshold" if recognizer.score_type == "asnorm"
+        and "asnorm" not in book.thresholds else None,
+    })
 
 
 def cmd_diarize(args):
@@ -127,7 +156,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("list", cmd_list, "show enrolled speakers", book=True)
 
-    p = add("verify", cmd_verify, "compare two clips", threshold=True)
+    p = add("verify", cmd_verify, "compare two clips (uses the book's threshold and cohort if it exists)",
+            book=True, threshold=True)
     p.add_argument("a")
     p.add_argument("b")
 
@@ -135,7 +165,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("audio")
     p.add_argument("--top-k", type=int, default=3)
 
-    add("calibrate", cmd_calibrate, "fit a threshold from the enrolled speakers", book=True)
+    add("calibrate", cmd_calibrate, "fit a threshold from the enrolled speakers and save it in the book", book=True)
+
+    p = add("cohort", cmd_cohort, "set or clear the AS-norm background cohort stored in the book", book=True)
+    p.add_argument("audio", nargs="*", help="clips of speakers you do NOT want to recognize")
+    p.add_argument("--top-k", type=int, default=300, help="cohort scores averaged per side")
+    p.add_argument("--clear", action="store_true", help="remove the cohort and go back to raw cosine")
 
     p = add("diarize", cmd_diarize, "segment a recording by speaker", book=True, threshold=True)
     p.add_argument("audio")

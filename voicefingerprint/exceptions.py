@@ -16,3 +16,7 @@ class FeatureError(VoicefingerprintError):
 
 class EnrollmentError(VoicefingerprintError):
     """Speaker enrollment or lookup failed."""
+
+
+class CalibrationError(VoicefingerprintError):
+    """No valid decision threshold, or calibration could not be run on the data available."""

@@ -10,11 +10,14 @@ import numpy as np
 from .exceptions import EnrollmentError
 from .logging_utils import get_logger
 from .numeric import matmul
-from .scoring import l2_normalize
+from .scoring import SCORE_ASNORM, SCORE_COSINE, l2_normalize
 
 log = get_logger(__name__)
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+READABLE_VERSIONS = (1, 2)  # v1 had no thresholds and no cohort
+SCORE_TYPES = (SCORE_COSINE, SCORE_ASNORM)
+DEFAULT_COHORT_TOP_K = 300
 
 
 @dataclass
@@ -41,12 +44,22 @@ class Speaker:
 
 
 class SpeakerBook:
-    """A small in-memory database of enrolled speakers, serializable to a single .npz file."""
+    """A small in-memory database of enrolled speakers, serializable to a single .npz file.
+
+    Besides the speakers it holds the scoring setup they were calibrated under:
+    thresholds keyed by score type ("cosine" or "asnorm") and the optional AS-norm cohort.
+    An "asnorm" threshold only means something for the cohort it was fitted with, so
+    set_cohort() drops it whenever the cohort actually changes.
+    """
 
     def __init__(self, model: str, embedding_dim: int):
         self.model = model
         self.embedding_dim = embedding_dim
         self._speakers: Dict[str, Speaker] = {}
+        self.thresholds: Dict[str, float] = {}
+        self.cohort: Optional[np.ndarray] = None  # (n_cohort, dim), L2-normalized
+        self.cohort_top_k: int = DEFAULT_COHORT_TOP_K
+        self.cohort_version = 0  # bumped on every cohort change, so callers can cache an ASNorm
 
     def __len__(self) -> int:
         return len(self._speakers)
@@ -83,6 +96,37 @@ class SpeakerBook:
         if self._speakers.pop(name, None) is None:
             raise EnrollmentError(f"speaker {name!r} is not enrolled")
 
+    def set_threshold(self, score_type: str, value: float) -> None:
+        if score_type not in SCORE_TYPES:
+            raise ValueError(f"unknown score type {score_type!r}; expected one of {SCORE_TYPES}")
+        self.thresholds[score_type] = float(value)
+
+    def set_cohort(self, embeddings: Optional[np.ndarray], top_k: int = DEFAULT_COHORT_TOP_K) -> None:
+        """Store (or with None, clear) the AS-norm cohort. Drops a stale "asnorm" threshold."""
+        if embeddings is not None:
+            embeddings = l2_normalize(np.atleast_2d(np.asarray(embeddings, dtype=np.float32)))
+            if embeddings.shape[1] != self.embedding_dim:
+                raise EnrollmentError(f"expected {self.embedding_dim}-d cohort embeddings, got {embeddings.shape[1]}-d")
+            if len(embeddings) == 0:
+                raise EnrollmentError("cohort is empty")
+
+        unchanged = (
+            (embeddings is None and self.cohort is None)
+            or (
+                embeddings is not None
+                and self.cohort is not None
+                and top_k == self.cohort_top_k
+                and np.array_equal(embeddings, self.cohort)
+            )
+        )
+        if unchanged:
+            return
+        if self.thresholds.pop(SCORE_ASNORM, None) is not None:
+            log.warning("cohort changed; dropping the AS-norm threshold calibrated on the old cohort")
+        self.cohort = embeddings
+        self.cohort_top_k = int(top_k)
+        self.cohort_version += 1
+
     def centroids(self) -> Tuple[List[str], np.ndarray]:
         """Names and their (n_speakers, dim) centroid matrix, in a stable order."""
         if not self._speakers:
@@ -109,8 +153,18 @@ class SpeakerBook:
             arrays[f"emb_{i}"] = speaker.embeddings
             index.append({"name": name, "key": f"emb_{i}", "metadata": speaker.metadata})
 
+        if self.cohort is not None:
+            arrays["cohort"] = self.cohort
+
         header = json.dumps(
-            {"version": FORMAT_VERSION, "model": self.model, "embedding_dim": self.embedding_dim, "speakers": index}
+            {
+                "version": FORMAT_VERSION,
+                "model": self.model,
+                "embedding_dim": self.embedding_dim,
+                "speakers": index,
+                "thresholds": self.thresholds,
+                "cohort": {"key": "cohort", "top_k": self.cohort_top_k} if self.cohort is not None else None,
+            }
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(path, header=np.array(header), **arrays)
@@ -125,7 +179,7 @@ class SpeakerBook:
 
         with np.load(path, allow_pickle=False) as data:
             header = json.loads(str(data["header"]))
-            if header.get("version") != FORMAT_VERSION:
+            if header.get("version") not in READABLE_VERSIONS:
                 raise EnrollmentError(f"unsupported speaker book version {header.get('version')}")
             # Embeddings from different encoders are not comparable, so refuse to mix them.
             if expect_model and header["model"] != expect_model:
@@ -135,6 +189,13 @@ class SpeakerBook:
             book = cls(header["model"], header["embedding_dim"])
             for entry in header["speakers"]:
                 book.add(entry["name"], data[entry["key"]], entry.get("metadata"))
+            for score_type, value in (header.get("thresholds") or {}).items():
+                book.set_threshold(score_type, value)
+            cohort = header.get("cohort")
+            if cohort:
+                book.cohort = l2_normalize(np.asarray(data[cohort["key"]], dtype=np.float32))
+                book.cohort_top_k = int(cohort.get("top_k", DEFAULT_COHORT_TOP_K))
+                book.cohort_version += 1
         return book
 
     def summary(self) -> List[dict]:

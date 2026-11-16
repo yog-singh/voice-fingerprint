@@ -185,7 +185,7 @@ def assign_to_enrolled(
     threshold = recognizer.threshold if threshold is None else threshold
 
     n_samples, embeddings, slices, segments = _timeline(recognizer, source, rate, source_sr)
-    scores = matmul(embeddings, centroids.T)
+    scores = recognizer.score_matrix(embeddings, centroids)  # same units as recognizer.threshold
     best = np.argmax(scores, axis=1)
 
     best_scores = scores[np.arange(len(best)), best]
