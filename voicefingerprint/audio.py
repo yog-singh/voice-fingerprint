@@ -75,13 +75,15 @@ def preprocess(
     config: Optional[PreprocessConfig] = None,
     source_sr: Optional[int] = None,
 ) -> np.ndarray:
-    """Load, resample, level and (optionally) strip silence. Returns float32 mono."""
-    config = config or PreprocessConfig()
-    wav = load_audio(source, config.sample_rate, source_sr)
-    original = len(wav)
+    """Load, resample, level and (optionally) strip silence. Returns float32 mono.
 
-    if config.normalize_volume:
-        wav = normalize_volume(wav, config.target_dbfs)
+    Trimming concatenates the speech, so sample positions in the result no longer line up
+    with the source. Anything that reports times (diarization) should use load_and_level()
+    plus speech_mask() instead.
+    """
+    config = config or PreprocessConfig()
+    wav = load_and_level(source, config, source_sr)
+    original = len(wav)
 
     if config.trim_silence and config.vad_backend != "none":
         from .vad import get_vad, apply_vad
@@ -92,6 +94,28 @@ def preprocess(
         raise AudioError("no speech left after preprocessing")
     log.debug("preprocess: %d -> %d samples (%.0f%% kept)", original, len(wav), 100 * len(wav) / max(original, 1))
     return wav
+
+
+def load_and_level(
+    source: AudioInput,
+    config: Optional[PreprocessConfig] = None,
+    source_sr: Optional[int] = None,
+) -> np.ndarray:
+    """Load, resample and level, without removing anything. Sample i is still at time i / sr."""
+    config = config or PreprocessConfig()
+    wav = load_audio(source, config.sample_rate, source_sr)
+    if config.normalize_volume:
+        wav = normalize_volume(wav, config.target_dbfs)
+    return wav
+
+
+def speech_mask(wav: np.ndarray, config: Optional[PreprocessConfig] = None) -> np.ndarray:
+    """Per-sample speech mask under the configured VAD; all True when trimming is disabled."""
+    config = config or PreprocessConfig()
+    from .vad import get_vad, robust_speech_mask
+
+    vad = get_vad(config.vad_backend, config.sample_rate) if config.trim_silence else None
+    return robust_speech_mask(wav, vad, config.sample_rate)
 
 
 def to_int16_scale(wav: np.ndarray) -> np.ndarray:

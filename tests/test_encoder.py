@@ -65,3 +65,16 @@ def test_recognizer_enroll_identify_roundtrip(encoder, tmp_path, wav_a, wav_b):
 def test_identify_without_enrollment_raises(encoder, wav_a):
     with pytest.raises(EnrollmentError, match="no speakers enrolled"):
         VoiceRecognizer(Config()).identify(wav_a, source_sr=SR)
+
+
+def test_diarize_timestamps_survive_a_silent_gap(encoder, wav_a, wav_b):
+    """With the real model and default energy VAD, speaker B still starts at ~10 s, not ~4 s."""
+    from voicefingerprint import diarize
+
+    signal = np.concatenate([wav_a, np.zeros(6 * SR, dtype=np.float32), wav_b])
+    turns = diarize(VoiceRecognizer(Config()), signal, n_speakers=2, source_sr=SR)
+
+    assert turns[0].start == pytest.approx(0.0, abs=0.05)
+    assert turns[-1].end == pytest.approx(14.0, abs=0.05)
+    assert turns[-1].start == pytest.approx(10.0, abs=0.5)
+    assert not any(t.start < 9.0 and t.end > 5.0 for t in turns), "no turn should cover the silent gap"

@@ -5,9 +5,11 @@ from typing import List, Optional
 
 import numpy as np
 
+from .audio import load_and_level, speech_mask
 from .logging_utils import get_logger
 from .numeric import matmul
 from .scoring import l2_normalize
+from .vad import mask_to_segments
 
 log = get_logger(__name__)
 
@@ -90,6 +92,51 @@ def _merge(turns: List[Turn], min_duration: float) -> List[Turn]:
     return [t for t in merged if t.end - t.start >= min_duration]
 
 
+def _to_source_time(turns: List[Turn], segments) -> List[Turn]:
+    """Map turns on the trimmed (speech-only) timeline back to the source timeline.
+
+    segments are the source-time speech spans (seconds, sorted) that were concatenated to
+    form the trimmed waveform. A turn that crosses a junction in trimmed time is split,
+    so the silence between segments never appears inside a turn.
+    """
+    offsets = np.concatenate([[0.0], np.cumsum([end - start for start, end in segments])])
+    mapped: List[Turn] = []
+    k = 0
+    for turn in turns:
+        while k < len(segments) and offsets[k + 1] <= turn.start:
+            k += 1
+        j = k
+        while j < len(segments) and offsets[j] < turn.end:
+            lo, hi = max(turn.start, offsets[j]), min(turn.end, offsets[j + 1])
+            if hi > lo:
+                shift = segments[j][0] - offsets[j]
+                mapped.append(Turn(turn.speaker, lo + shift, hi + shift, turn.score))
+            j += 1
+    return mapped
+
+
+def _timeline(recognizer, source, rate: float, source_sr: Optional[int]):
+    """Dense embeddings of the speech, plus the source-time spans that speech came from.
+
+    The encoder sees the same speech-only waveform as preprocess() would produce, so
+    windows never mix speech with stretches of silence. Turn times are mapped back to
+    the source afterwards with _to_source_time().
+    """
+    config = recognizer.config.preprocess
+    wav = load_and_level(source, config, source_sr)
+    mask = speech_mask(wav, config)
+    speech = np.ascontiguousarray(wav[mask]) if not mask.all() else wav
+    embeddings, slices = recognizer.encoder.embed_timeline(speech, rate=rate)
+    sample_rate = recognizer.encoder.sample_rate
+    segments = [(start / sample_rate, end / sample_rate) for start, end in mask_to_segments(mask)]
+    return len(speech), embeddings, slices, segments
+
+
+def _finish(labels, slices, scores, sample_rate: int, n_samples: int, segments, min_duration: float) -> List[Turn]:
+    turns = _merge(_turns_from_windows(labels, slices, scores, sample_rate, n_samples), 0.0)
+    return _merge(_to_source_time(turns, segments), min_duration)
+
+
 def diarize(
     recognizer,
     source,
@@ -97,21 +144,26 @@ def diarize(
     n_speakers: Optional[int] = None,
     threshold: float = 0.55,
     min_duration: float = 0.5,
+    source_sr: Optional[int] = None,
 ) -> List[Turn]:
-    """Unsupervised diarization: cluster the timeline into "speaker_0", "speaker_1", ..."""
-    wav = recognizer.preprocess(source)
-    embeddings, slices = recognizer.encoder.embed_timeline(wav, rate=rate)
+    """Unsupervised diarization: cluster the timeline into "speaker_0", "speaker_1", ...
+
+    Turn times are seconds from the start of the source; silence detected by the VAD is
+    left out of the turns. Pass source_sr when source is a raw array.
+    """
+    n_samples, embeddings, slices, segments = _timeline(recognizer, source, rate, source_sr)
     labels = agglomerative(embeddings, threshold=threshold, n_clusters=n_speakers)
     log.info("diarized %d windows into %d speaker(s)", len(labels), len(set(labels)))
 
-    turns = _turns_from_windows(
+    return _finish(
         [f"speaker_{label}" for label in labels],
         slices,
         np.ones(len(labels)),
         recognizer.encoder.sample_rate,
-        len(wav),
+        n_samples,
+        segments,
+        min_duration,
     )
-    return _merge(turns, min_duration)
 
 
 def assign_to_enrolled(
@@ -121,19 +173,21 @@ def assign_to_enrolled(
     threshold: Optional[float] = None,
     min_duration: float = 0.5,
     unknown_label: str = "unknown",
+    source_sr: Optional[int] = None,
 ) -> List[Turn]:
-    """Diarization against known speakers: label each window with the best enrolled match."""
+    """Diarization against known speakers: label each window with the best enrolled match.
+
+    Turn times are seconds from the start of the source; silence is left out of the turns.
+    """
     names, centroids = recognizer.book.centroids()
     if not names:
         raise ValueError("no speakers enrolled; use diarize() for the unsupervised case")
     threshold = recognizer.threshold if threshold is None else threshold
 
-    wav = recognizer.preprocess(source)
-    embeddings, slices = recognizer.encoder.embed_timeline(wav, rate=rate)
+    n_samples, embeddings, slices, segments = _timeline(recognizer, source, rate, source_sr)
     scores = matmul(embeddings, centroids.T)
     best = np.argmax(scores, axis=1)
 
     best_scores = scores[np.arange(len(best)), best]
     assigned = [names[b] if sc >= threshold else unknown_label for b, sc in zip(best, best_scores)]
-    turns = _turns_from_windows(assigned, slices, best_scores, recognizer.encoder.sample_rate, len(wav))
-    return _merge(turns, min_duration)
+    return _finish(assigned, slices, best_scores, recognizer.encoder.sample_rate, n_samples, segments, min_duration)
