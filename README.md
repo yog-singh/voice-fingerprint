@@ -156,6 +156,12 @@ emitting plausible-looking garbage.
 A speaker book records which encoder produced it and refuses to load under a different
 one, since embeddings from different models are not comparable.
 
+Books are saved atomically (written to a temporary file, then swapped in), so a crash
+mid-save leaves the previous book intact. `.npz` is appended to the name unless it is
+already there, so `team.v2` saves as `team.v2.npz`. Speaker metadata is stored in the
+book's JSON header and must be JSON-serializable; anything else is rejected at
+enrollment.
+
 ## Development
 
 ```bash

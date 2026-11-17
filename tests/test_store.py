@@ -124,3 +124,49 @@ def test_changing_the_cohort_drops_the_asnorm_threshold_only():
 def test_unknown_score_type_is_rejected():
     with pytest.raises(ValueError, match="unknown score type"):
         _book().set_threshold("plda", 1.0)
+
+
+def test_dotted_names_are_distinct_files(tmp_path):
+    v1, v2 = _book(), _book()
+    v2.remove("bob")
+    p1, p2 = v1.save(tmp_path / "team.v1"), v2.save(tmp_path / "team.v2")
+    assert (p1.name, p2.name) == ("team.v1.npz", "team.v2.npz")
+    assert SpeakerBook.load(tmp_path / "team.v1").names == ["alice", "bob"]
+    assert SpeakerBook.load(tmp_path / "team.v2").names == ["alice"]
+    assert _book().save(tmp_path / "plain.npz").name == "plain.npz"
+
+
+def test_book_saved_under_legacy_name_still_loads(tmp_path):
+    # Older versions saved "team.v2" as "team.npz" (Path.with_suffix).
+    _book().save(tmp_path / "team.npz")
+    assert SpeakerBook.load(tmp_path / "team.v2").names == ["alice", "bob"]
+
+
+def test_failed_save_keeps_the_old_book(tmp_path, monkeypatch):
+    path = _book().save(tmp_path / "speakers")
+    before = path.read_bytes()
+
+    def crash(handle, **arrays):
+        handle.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(np, "savez_compressed", crash)
+    bigger = _book()
+    bigger.add("carol", np.ones((1, DIM)))
+    with pytest.raises(OSError, match="disk full"):
+        bigger.save(path)
+
+    assert path.read_bytes() == before
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["speakers.npz"]  # no temp file left
+
+
+def test_unserializable_metadata_is_rejected_at_enrollment():
+    import datetime
+
+    book = _book()
+    with pytest.raises(EnrollmentError, match="JSON-serializable"):
+        book.add("carol", np.ones((1, DIM)), {"recorded_at": datetime.datetime.now()})
+    assert "carol" not in book
+    with pytest.raises(EnrollmentError, match="JSON-serializable"):
+        book.add("alice", np.ones((1, DIM)), {"recorded_at": datetime.date.today()})
+    assert book["alice"].n_utterances == 3 and "recorded_at" not in book["alice"].metadata

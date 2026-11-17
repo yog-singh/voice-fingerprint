@@ -90,3 +90,28 @@ def test_silero_rejects_unsupported_sample_rates():
         pytest.skip(f"Silero unavailable: {exc}")
     with pytest.raises(ModelError, match="8 or 16 kHz"):
         vad.speech_mask(np.zeros(44100, dtype=np.float32), 44100)
+
+
+def test_silero_is_loaded_once_across_clips(monkeypatch, wav_a):
+    from voicefingerprint import vad as vad_module
+    from voicefingerprint.audio import speech_mask
+
+    created = []
+
+    class FakeSilero:
+        def __init__(self):
+            created.append(self)
+
+        def speech_mask(self, wav, sample_rate):
+            return np.ones(len(wav), dtype=bool)
+
+    monkeypatch.setattr(vad_module, "SileroVAD", FakeSilero)
+    vad_module.get_vad.cache_clear()
+    try:
+        config = PreprocessConfig(vad_backend="silero")
+        for _ in range(3):
+            preprocess(wav_a, config, source_sr=16000)
+            speech_mask(wav_a, config)
+        assert len(created) == 1
+    finally:
+        vad_module.get_vad.cache_clear()
