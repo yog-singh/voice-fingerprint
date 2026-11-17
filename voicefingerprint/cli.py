@@ -1,7 +1,6 @@
 import argparse
 import json
 import sys
-from pathlib import Path
 
 import numpy as np
 
@@ -11,7 +10,7 @@ from .exceptions import VoicefingerprintError
 from .logging_utils import set_level
 from .models import DEFAULT_MODEL, REGISTRY
 from .recognizer import VoiceRecognizer
-from .store import SpeakerBook
+from .store import SpeakerBook, find_book
 
 
 def _build(args) -> VoiceRecognizer:
@@ -20,7 +19,7 @@ def _build(args) -> VoiceRecognizer:
         preprocess=PreprocessConfig(vad_backend=args.vad),
     )
     book = None
-    if getattr(args, "book", None) and Path(args.book).with_suffix(".npz").is_file():
+    if getattr(args, "book", None) and find_book(args.book) is not None:
         book = SpeakerBook.load(args.book, expect_model=args.model)
     return VoiceRecognizer(config, book=book, threshold=getattr(args, "threshold", None))
 

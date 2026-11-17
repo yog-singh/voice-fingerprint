@@ -1,5 +1,6 @@
 """Voice activity detection used to strip non-speech before embedding."""
 
+import functools
 from dataclasses import dataclass
 from typing import List, Optional, Protocol, Tuple
 
@@ -122,7 +123,15 @@ class SileroVAD:
         return {name: outputs[i + 1] for i, name in enumerate(names)}
 
 
+@functools.lru_cache(maxsize=None)
 def get_vad(backend: str, sample_rate: int = 16000) -> Optional[VAD]:
+    """Shared VAD instance for a backend.
+
+    Cached because SileroVAD opens an ONNX session (and checks the Hugging Face cache)
+    when constructed, and preprocessing asks for a VAD once per clip. Sharing is safe:
+    speech_mask() keeps no state between calls, and ONNX Runtime sessions are
+    thread-safe. Call get_vad.cache_clear() to force a reload.
+    """
     if backend == "none":
         return None
     if backend == "energy":

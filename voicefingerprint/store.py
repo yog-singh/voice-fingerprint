@@ -1,6 +1,8 @@
 """Persistent enrollment store: named speakers and their embedding centroids."""
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -18,6 +20,43 @@ FORMAT_VERSION = 2
 READABLE_VERSIONS = (1, 2)  # v1 had no thresholds and no cohort
 SCORE_TYPES = (SCORE_COSINE, SCORE_ASNORM)
 DEFAULT_COHORT_TOP_K = 300
+SUFFIX = ".npz"
+
+
+def book_path(path) -> Path:
+    """File a book named `path` is written to: `path` itself if it ends in .npz, else path + ".npz".
+
+    Appending (rather than Path.with_suffix) keeps dotted names distinct: "team.v2" is
+    "team.v2.npz", not "team.npz".
+    """
+    path = Path(path)
+    return path if path.suffix == SUFFIX else path.with_name(path.name + SUFFIX)
+
+
+def find_book(path) -> Optional[Path]:
+    """Existing file for a book named `path`, or None.
+
+    Falls back to the pre-fix location (with_suffix, so "team.v2" -> "team.npz") so
+    books saved by older versions still load; the next save writes the new location.
+    """
+    current = book_path(path)
+    if current.is_file():
+        return current
+    legacy = Path(path).with_suffix(SUFFIX)
+    if legacy != current and legacy.is_file():
+        log.warning("loading %s from its legacy location %s; it will be saved to %s", path, legacy, current)
+        return legacy
+    return None
+
+
+def _check_metadata(name: str, metadata: dict) -> None:
+    try:
+        json.dumps(metadata)
+    except (TypeError, ValueError) as exc:
+        raise EnrollmentError(
+            f"metadata for {name!r} must be JSON-serializable (str, int, float, bool, None, list, dict), "
+            f"since it is stored in the book header: {exc}"
+        ) from None
 
 
 @dataclass
@@ -83,12 +122,16 @@ class SpeakerBook:
         if embeddings.shape[1] != self.embedding_dim:
             raise EnrollmentError(f"expected {self.embedding_dim}-d embeddings, got {embeddings.shape[1]}-d")
 
+        metadata = dict(metadata or {})
+        merged = {**self._speakers[name].metadata, **metadata} if name in self._speakers else metadata
+        _check_metadata(name, merged)  # fail here, not at save() time
+
         if name in self._speakers:
             existing = self._speakers[name]
             existing.embeddings = np.concatenate([existing.embeddings, embeddings])
-            existing.metadata.update(metadata or {})
+            existing.metadata = merged
         else:
-            self._speakers[name] = Speaker(name, embeddings, dict(metadata or {}))
+            self._speakers[name] = Speaker(name, embeddings, metadata)
         log.info("enrolled %r with %d utterance(s) total", name, self._speakers[name].n_utterances)
         return self._speakers[name]
 
@@ -146,7 +189,13 @@ class SpeakerBook:
         return np.concatenate(rows), labels
 
     def save(self, path) -> Path:
-        path = Path(path).with_suffix(".npz")
+        """Write the book to `path` (".npz" appended unless present). Returns the file written.
+
+        The write is atomic: the book goes to a temporary file in the same directory,
+        which then replaces the target, so a crash leaves either the old book or the new
+        one, never a truncated file.
+        """
+        path = book_path(path)
         arrays, index = {}, []
         for i, name in enumerate(self.names):
             speaker = self._speakers[name]
@@ -167,15 +216,29 @@ class SpeakerBook:
             }
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, header=np.array(header), **arrays)
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                np.savez_compressed(handle, header=np.array(header), **arrays)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+        _fsync_dir(path.parent)
         log.info("saved %d speaker(s) to %s", len(self), path)
         return path
 
     @classmethod
     def load(cls, path, expect_model: Optional[str] = None) -> "SpeakerBook":
-        path = Path(path).with_suffix(".npz")
-        if not path.is_file():
-            raise EnrollmentError(f"speaker book not found: {path}")
+        found = find_book(path)
+        if found is None:
+            raise EnrollmentError(f"speaker book not found: {book_path(path)}")
+        path = found
 
         with np.load(path, allow_pickle=False) as data:
             header = json.loads(str(data["header"]))
@@ -207,3 +270,17 @@ class SpeakerBook:
             }
             for name in self.names
         ]
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Make the rename itself durable. Not supported on Windows, where it is skipped."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
